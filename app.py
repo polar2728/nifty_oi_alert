@@ -4,9 +4,21 @@ from datetime import datetime, time as dtime, timedelta, timezone
 from fyers_apiv3 import fyersModel
 
 # ================= PAGE CONFIG =================
-st.set_page_config(page_title="NIFTY OI Spike Monitor", layout="wide")
+st.set_page_config(
+    page_title="NIFTY OI Spike Monitor",
+    layout="wide"
+)
+
 st.title("📊 NIFTY Weekly OI Spike Monitor")
 st.caption("Manual scan • Streamlit Cloud compatible")
+
+# ================= SIDEBAR CONTROLS =================
+st.sidebar.header("⚙ Controls")
+
+CHECK_MARKET_HOURS = st.sidebar.toggle(
+    "Enable Market Hours Filter (9:15–15:30 IST)",
+    value=False
+)
 
 # ================= CONFIG =================
 OI_SPIKE_THRESHOLD  = 500
@@ -39,8 +51,8 @@ def now_ist():
     return datetime.now(IST)
 
 def is_market_open():
-    return True  # relaxed for cloud manual scan
-    # return dtime(9, 15) <= t <= dtime(15, 30)
+    t = now_ist().time()
+    return dtime(9, 15) <= t <= dtime(15, 30)
 
 def reset_on_new_trading_day():
     today = now_ist().date()
@@ -51,7 +63,7 @@ def reset_on_new_trading_day():
         st.session_state.last_run_date = today
         st.info("🔄 New trading day → baseline reset")
 
-# ================= API =================
+# ================= API CALLS =================
 def get_nifty_spot():
     q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
     if q.get("s") == "ok" and q.get("d"):
@@ -66,7 +78,8 @@ def fetch_option_chain():
     })
     if resp.get("s") != "ok":
         return None, None
-    return resp["data"]["optionsChain"], resp["data"]["expiryData"]
+    data = resp["data"]
+    return data.get("optionsChain", []), data.get("expiryData", [])
 
 def expiry_to_symbol_format(date_str):
     try:
@@ -77,21 +90,57 @@ def expiry_to_symbol_format(date_str):
 
 def get_current_weekly_expiry(expiry_list):
     today = now_ist().date()
-    choices = []
-    for e in expiry_list:
+    candidates = []
+    for exp in expiry_list:
         try:
-            d = datetime.fromtimestamp(int(e["expiry"])).date()
-            choices.append(((d - today).days, e["date"]))
+            exp_date = datetime.fromtimestamp(int(exp["expiry"])).date()
+            candidates.append(((exp_date - today).days, exp["date"]))
         except:
             pass
-    return sorted(choices)[0][1] if choices else None
+    return sorted(candidates)[0][1] if candidates else None
+
+# ================= TABLE STYLING =================
+def style_table(df):
+    def highlight_row(r):
+        styles = [""] * len(r)
+
+        if r["ATM"]:
+            styles = ["background-color:#fff3cd"] * len(r)
+
+        if abs(r["CE OI %"]) > OI_SPIKE_THRESHOLD:
+            styles[0] = "background-color:#ffebee;color:#c62828"
+
+        if abs(r["PE OI %"]) > OI_SPIKE_THRESHOLD:
+            styles[-1] = "background-color:#ffebee;color:#c62828"
+
+        if r["CE OI %"] > r["PE OI %"]:
+            styles[0] += ";font-weight:600;color:#2e7d32"
+        elif r["PE OI %"] > r["CE OI %"]:
+            styles[-1] += ";font-weight:600;color:#2e7d32"
+
+        return styles
+
+    return (
+        df.style
+        .apply(highlight_row, axis=1)
+        .format({
+            "CE OI %": "{:+.1f}%",
+            "PE OI %": "{:+.1f}%",
+            "CE LTP": "₹{:.2f}",
+            "PE LTP": "₹{:.2f}"
+        })
+    )
 
 # ================= SCAN =================
 def scan():
+    if CHECK_MARKET_HOURS and not is_market_open():
+        st.warning("⏱ Market is closed (filter enabled)")
+        return
+
     reset_on_new_trading_day()
 
     spot = get_nifty_spot()
-    if not spot:
+    if spot is None:
         st.error("Failed to fetch NIFTY spot")
         return
 
@@ -112,20 +161,12 @@ def scan():
     df = pd.DataFrame(raw)
     df = df[df["symbol"].str.contains(expiry_filter, regex=False, na=False)]
 
-    if df.empty:
-        df = pd.DataFrame(raw)
-
     df = df[
         (df["strike_price"] >= atm - STRIKE_RANGE_POINTS) &
         (df["strike_price"] <= atm + STRIKE_RANGE_POINTS)
     ]
 
-    if df.empty:
-        st.warning("No strikes found")
-        return
-
-    # ========== BUILD CE–STRIKE–PE TABLE ==========
-    rows = []
+    rows = {}
 
     for _, r in df.iterrows():
         strike = int(r.strike_price)
@@ -135,78 +176,38 @@ def scan():
         key = f"{opt}_{strike}"
 
         prev_oi = st.session_state.prev_oi.get(key, 0)
-        prev_ltp = st.session_state.prev_ltp.get(key, 0)
+        oi_pct = ((oi - prev_oi) / prev_oi * 100) if prev_oi >= MIN_BASE_OI else 0
 
-        oi_pct = ((oi - prev_oi) / prev_oi * 100) if prev_oi > 0 else 0
-        ltp_arrow = "↑" if ltp > prev_ltp else "↓" if prev_ltp else ""
-
-        row = next((x for x in rows if x["STRIKE"] == strike), None)
-        if not row:
-            row = {
-                "CALL OI": "",
-                "CALL ΔOI": "",
-                "CALL LTP": "",
-                "STRIKE": strike,
-                "PUT LTP": "",
-                "PUT ΔOI": "",
-                "PUT OI": "",
-                "_ce_oi": 0,
-                "_pe_oi": 0,
-                "_atm": strike == atm
+        if strike not in rows:
+            rows[strike] = {
+                "Strike": strike,
+                "CE OI %": 0, "CE LTP": 0,
+                "PE OI %": 0, "PE LTP": 0,
+                "ATM": strike == atm
             }
-            rows.append(row)
 
         if opt == "CE":
-            row["CALL OI"] = f"{oi:,}"
-            row["CALL ΔOI"] = f"{oi_pct:+.1f}%"
-            row["CALL LTP"] = f"{ltp:.2f} {ltp_arrow}"
-            row["_ce_oi"] = oi
+            rows[strike]["CE OI %"] = oi_pct
+            rows[strike]["CE LTP"] = ltp
         else:
-            row["PUT OI"] = f"{oi:,}"
-            row["PUT ΔOI"] = f"{oi_pct:+.1f}%"
-            row["PUT LTP"] = f"{ltp:.2f} {ltp_arrow}"
-            row["_pe_oi"] = oi
+            rows[strike]["PE OI %"] = oi_pct
+            rows[strike]["PE LTP"] = ltp
 
         st.session_state.prev_oi[key] = oi
         st.session_state.prev_ltp[key] = ltp
 
-    table_df = pd.DataFrame(rows).sort_values("STRIKE")
+    df_view = pd.DataFrame(rows.values()).sort_values("Strike", ascending=False)
 
-    # ========== STYLING ==========
-    def style_row(r):
-        styles = []
-        if r["_atm"]:
-            styles.append("background-color:#fff8e1")
-        if r["_ce_oi"] > r["_pe_oi"] * 1.2:
-            styles.append("background-color:#eef6ff")
-        elif r["_pe_oi"] > r["_ce_oi"] * 1.2:
-            styles.append("background-color:#f1f8f5")
-        return styles
-
-    def style_cells(val):
-        try:
-            if "%" in val:
-                pct = float(val.replace("%", ""))
-                if pct > OI_SPIKE_THRESHOLD:
-                    return "color:#b71c1c;font-weight:600"
-        except:
-            pass
-        return ""
-
-    styled = (
-        table_df
-        .drop(columns=["_ce_oi", "_pe_oi", "_atm"])
-        .style
-        .apply(style_row, axis=1)
-        .applymap(style_cells, subset=["CALL ΔOI", "PUT ΔOI"])
+    st.subheader(f"📅 Weekly Expiry: {expiry}")
+    st.dataframe(
+        style_table(df_view),
+        use_container_width=True,
+        hide_index=True
     )
-
-    st.subheader(f"📊 Option Chain (Expiry: {expiry})")
-    st.dataframe(styled, use_container_width=True, hide_index=True)
 
     if not st.session_state.warmed_up:
         st.session_state.warmed_up = True
-        st.info("Baseline captured. Click again to detect OI spikes.")
+        st.info("Baseline captured. Click again to detect spikes.")
 
 # ================= UI =================
 st.markdown("---")
