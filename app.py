@@ -1,136 +1,129 @@
 import streamlit as st
 import pandas as pd
-import time
-from datetime import datetime, time as dtime, timezone, timedelta
+from datetime import datetime, time as dtime, timedelta, timezone
 from fyers_apiv3 import fyersModel
-import threading
+
+# ================= PAGE CONFIG =================
+st.set_page_config(
+    page_title="NIFTY OI Spike Monitor",
+    layout="wide"
+)
+
+st.title("📊 NIFTY Weekly OI Spike Monitor")
+st.caption("Manual scan • Streamlit Cloud compatible")
 
 # ================= CONFIG =================
-OI_SPIKE_THRESHOLD   = 500
-MIN_BASE_OI          = 1000
-MAX_ALERTS_TO_KEEP   = 50
-STRIKE_RANGE_POINTS  = 150
+OI_SPIKE_THRESHOLD  = 500
+MIN_BASE_OI         = 1000
+STRIKE_RANGE_POINTS = 150
 
-# IST timezone
+# ================= TIMEZONE =================
 IST = timezone(timedelta(hours=5, minutes=30))
-
-# Prevent concurrent API calls during burst
-api_lock = threading.Lock()
-
-# ================= STREAMLIT =================
-st.set_page_config(page_title="Nifty OI Alert", layout="wide")
-st.title("🔥 NIFTY Weekly OI Spike Alert (ATM ±150)")
-st.caption("Alerts when OI increases >500% on current weekly expiry strikes")
-
-# ================= SECRETS =================
-client_id    = st.secrets["client_id"]
-access_token = st.secrets["access_token"]
-
-# ================= FYERS =================
-fyers = fyersModel.FyersModel(client_id=client_id, token=access_token, log_path="")
 
 # ================= SESSION STATE =================
 if "prev_oi" not in st.session_state:
     st.session_state.prev_oi = {}
-if "alerts" not in st.session_state:
-    st.session_state.alerts = []
-if "warmed_up" not in st.session_state:
+    st.session_state.prev_ltp = {}
     st.session_state.warmed_up = False
-if "last_check" not in st.session_state:
-    st.session_state.last_check = None
-if "last_run_date" not in st.session_state:
     st.session_state.last_run_date = None
 
+# ================= SECRETS =================
+CLIENT_ID    = st.secrets["client_id"]
+ACCESS_TOKEN = st.secrets["access_token"]
+
+# ================= FYERS =================
+fyers = fyersModel.FyersModel(
+    client_id=CLIENT_ID,
+    token=ACCESS_TOKEN,
+    log_path=""
+)
+
 # ================= HELPERS =================
+def now_ist():
+    return datetime.now(IST)
+
 def is_market_open():
-    now_ist = datetime.now(IST).time()
-    return dtime(9, 15) <= now_ist <= dtime(15, 30)
+    t = now_ist().time()
+    return dtime(9, 15) <= t <= dtime(15, 30)
 
 def reset_on_new_trading_day():
-    today = datetime.now(IST).date()
+    today = now_ist().date()
     if st.session_state.last_run_date != today and is_market_open():
         st.session_state.prev_oi = {}
+        st.session_state.prev_ltp = {}
         st.session_state.warmed_up = False
-        st.session_state.alerts = []
         st.session_state.last_run_date = today
-        st.toast("New trading day → OI baseline reset", icon="🔄")
+        st.info("🔄 New trading day → baseline reset")
 
-@st.cache_data(ttl=900, show_spinner="Fetching Nifty spot…")  # 15 min
+# ================= API CALLS =================
 def get_nifty_spot():
-    with api_lock:
-        time.sleep(0.6)  # tiny delay to avoid burst
-        try:
-            q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-            if q.get("s") == "ok" and q.get("d"):
-                return round(q["d"][0]["v"]["lp"])
-            else:
-                st.error(f"Quotes API returned: {q}")
-                return None
-        except Exception as e:
-            st.error(f"Quotes call failed: {str(e)}")
-            return None
+    q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
+    if q.get("s") == "ok" and q.get("d"):
+        return round(q["d"][0]["v"]["lp"])
+    return None
 
-@st.cache_data(ttl=3600, show_spinner="Loading option chain…")  # 1 hour
 def fetch_option_chain():
-    with api_lock:
-        time.sleep(0.6)
-        try:
-            resp = fyers.optionchain({
-                "symbol": "NSE:NIFTY50-INDEX",
-                "strikecount": 20,
-                "timestamp": ""
-            })
-            if resp.get("s") != "ok":
-                st.error(f"Option chain returned: {resp}")
-                return None, None
-            data = resp["data"]
-            return data.get("optionsChain", []), data.get("expiryData", [])
-        except Exception as e:
-            st.error(f"Option chain call failed: {str(e)}")
-            return None, None
+    resp = fyers.optionchain({
+        "symbol": "NSE:NIFTY50-INDEX",
+        "strikecount": 40,
+        "timestamp": ""
+    })
+    if resp.get("s") != "ok":
+        return None, None
+    data = resp["data"]
+    return data.get("optionsChain", []), data.get("expiryData", [])
+
+def expiry_to_symbol_format(date_str):
+    try:
+        d = datetime.strptime(date_str, "%d-%m-%Y")
+        return d.strftime("%y") + str(d.month) + d.strftime("%d")
+    except:
+        return None
 
 def get_current_weekly_expiry(expiry_list):
-    if not expiry_list:
-        return "Unknown"
-    today = datetime.now(IST).date()
-    weekly = []
+    today = now_ist().date()
+    candidates = []
     for exp in expiry_list:
         try:
-            exp_date = datetime.fromtimestamp(exp["expiry"]).date()
-            days = (exp_date - today).days
-            if 0 <= days <= 7:
-                weekly.append((days, exp["date"]))
+            exp_date = datetime.fromtimestamp(int(exp["expiry"])).date()
+            candidates.append(((exp_date - today).days, exp["date"]))
         except:
-            continue
-    if weekly:
-        weekly.sort()
-        return weekly[0][1]
-    return expiry_list[0]["date"] if expiry_list else "Unknown"
+            pass
+    return sorted(candidates)[0][1] if candidates else None
 
-# ================= CORE =================
-def scan_for_oi_spikes():
+# ================= SCAN =================
+def scan():
+    if not is_market_open():
+        st.warning("Market is closed")
+        return
+
     reset_on_new_trading_day()
 
     spot = get_nifty_spot()
     if spot is None:
-        return None, None, [], "Spot fetch failed"
+        st.error("Failed to fetch NIFTY spot")
+        return
 
     atm = int(round(spot / 50) * 50)
 
+    col1, col2 = st.columns(2)
+    col1.metric("NIFTY Spot", f"{spot:,}")
+    col2.metric("ATM Strike", atm)
+
     raw, expiry_info = fetch_option_chain()
-    if raw is None:
-        return spot, atm, [], "Chain fetch failed"
-
     if not raw:
-        return spot, atm, [], "Empty chain data"
-
-    df = pd.DataFrame(raw)
-    if df.empty:
-        return spot, atm, [], "No strikes in chain"
+        st.error("Option chain unavailable")
+        return
 
     expiry = get_current_weekly_expiry(expiry_info)
+    expiry_filter = expiry_to_symbol_format(expiry) or expiry
 
-    df = df[df["symbol"].str.contains(expiry, regex=False, na=False)]
+    df = pd.DataFrame(raw)
+    df = df[df["symbol"].str.contains(expiry_filter, regex=False, na=False)]
+
+    if df.empty:
+        st.warning("Expiry filter failed — using all strikes")
+        df = pd.DataFrame(raw)
 
     df = df[
         (df["strike_price"] >= atm - STRIKE_RANGE_POINTS) &
@@ -138,68 +131,74 @@ def scan_for_oi_spikes():
     ]
 
     if df.empty:
-        return spot, atm, [], f"{expiry} (no matching strikes)"
+        st.warning("No strikes in range")
+        return
 
+    alerts = []
+    table_rows = []
     current_oi = {}
-    new_alerts = []
+    current_ltp = {}
 
-    for _, row in df.iterrows():
-        strike = int(row.get("strike_price", 0))
-        opt_type = row.get("option_type", "?")
-        oi = int(row.get("oi", 0))
+    for _, r in df.iterrows():
+        strike = int(r.strike_price)
+        opt_type = r.option_type
+        oi = int(r.oi)
+        ltp = float(r.ltp)
         key = f"{opt_type}_{strike}"
 
+        prev_oi_val = st.session_state.prev_oi.get(key, 0)
+        oi_pct = ((oi - prev_oi_val) / prev_oi_val * 100) if prev_oi_val > 0 else 0
+
+        table_rows.append([
+            opt_type,
+            strike,
+            oi,
+            prev_oi_val if prev_oi_val else None,
+            round(oi_pct, 1),
+            round(ltp, 2)
+        ])
+
+        if (
+            st.session_state.warmed_up
+            and prev_oi_val >= MIN_BASE_OI
+            and oi_pct > OI_SPIKE_THRESHOLD
+            and oi > prev_oi_val
+        ):
+            alerts.append([opt_type, strike, prev_oi_val, oi, round(oi_pct, 1)])
+
         current_oi[key] = oi
+        current_ltp[key] = ltp
 
-        prev = st.session_state.prev_oi.get(key, 0)
+    df_view = pd.DataFrame(
+        table_rows,
+        columns=["Type", "Strike", "OI Now", "OI Prev", "OI %", "LTP"]
+    )
 
-        if st.session_state.warmed_up and prev >= MIN_BASE_OI and oi > prev:
-            pct = (oi - prev) / prev * 100
-            if pct > OI_SPIKE_THRESHOLD:
-                new_alerts.append({
-                    "time": datetime.now(IST).strftime("%H:%M:%S"),
-                    "msg": f"{opt_type} {strike} | +{pct:.1f}% | {prev:,} → {oi:,}"
-                })
+    st.subheader(f"Monitoring {len(df_view)} strikes (Expiry: {expiry})")
+    st.dataframe(df_view, use_container_width=True)
+
+    if alerts:
+        st.subheader("🚨 OI Spike Alerts")
+        st.dataframe(
+            pd.DataFrame(
+                alerts,
+                columns=["Type", "Strike", "OI Prev", "OI Now", "OI %"]
+            ),
+            use_container_width=True
+        )
+    else:
+        st.success("No OI spikes detected")
 
     if not st.session_state.warmed_up:
-        st.session_state.prev_oi = current_oi
         st.session_state.warmed_up = True
-        st.session_state.last_check = datetime.now(IST).strftime("%H:%M:%S")
-        return spot, atm, [], expiry
+        st.info("Baseline captured. Click again to detect spikes.")
 
     st.session_state.prev_oi = current_oi
-    st.session_state.last_check = datetime.now(IST).strftime("%H:%M:%S")
-
-    return spot, atm, new_alerts, expiry
+    st.session_state.prev_ltp = current_ltp
 
 # ================= UI =================
-spot, atm, new_alerts, expiry = scan_for_oi_spikes()
+st.markdown("---")
+if st.button("▶ Run OI Scan"):
+    scan()
 
-if spot:
-    c1, c2, c3 = st.columns([2, 2, 3])
-    c1.metric("NIFTY Spot", f"{spot:,.0f}")
-    c2.metric("ATM Strike", f"{atm:,.0f}")
-    c3.markdown(f"**Weekly Expiry:** {expiry}")
-
-    for a in new_alerts:
-        if a["msg"] not in [x["msg"] for x in st.session_state.alerts]:
-            st.session_state.alerts.append(a)
-            st.toast(f"🚨 {a['msg']}", icon="🚨")
-
-    st.session_state.alerts = st.session_state.alerts[-MAX_ALERTS_TO_KEEP:]
-
-    if st.session_state.alerts:
-        st.subheader("🚨 Recent OI Spike Alerts")
-        for a in st.session_state.alerts[::-1]:
-            st.markdown(f"**{a['time']}**  {a['msg']}")
-    else:
-        st.info("No significant OI spikes (>500%) detected yet")
-
-    st.success(f"Last checked: {st.session_state.last_check or '—'}")
-
-else:
-    st.warning("Market closed or data unavailable right now")
-
-# Only manual refresh
-if st.button("Refresh Data Now"):
-    st.rerun()
+st.caption("No auto-refresh • No WebSocket • Streamlit Cloud safe")
