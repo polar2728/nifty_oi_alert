@@ -44,7 +44,8 @@ def now_ist():
 
 def is_market_open():
     t = now_ist().time()
-    return dtime(9, 15) <= t <= dtime(15, 30)
+    return True
+    # return dtime(9, 15) <= t <= dtime(15, 30)
 
 def reset_on_new_trading_day():
     today = now_ist().date()
