@@ -5,13 +5,17 @@ from datetime import datetime, time as dtime, timezone, timedelta
 from fyers_apiv3 import fyersModel
 
 # ================= CONFIG =================
-REFRESH_INTERVAL     = 300
+REFRESH_INTERVAL     = 300           # 5 minutes
 OI_SPIKE_THRESHOLD   = 500
 MIN_BASE_OI          = 1000
 MAX_ALERTS_TO_KEEP   = 50
 MARKET_OPEN_TIME     = dtime(9, 15)
 MARKET_CLOSE_TIME    = dtime(15, 30)
 STRIKE_RANGE_POINTS  = 150
+
+# IST timezone setup
+IST_OFFSET = timedelta(hours=5, minutes=30)
+IST = timezone(IST_OFFSET)
 
 # ================= STREAMLIT =================
 st.set_page_config(page_title="Nifty OI Alert", layout="wide")
@@ -38,17 +42,12 @@ for key in ["prev_oi", "alerts", "last_check", "warmed_up", "last_run_date"]:
             st.session_state[key] = None
 
 # ================= HELPERS =================
-IST_OFFSET = timedelta(hours=5, minutes=30)
-IST = timezone(IST_OFFSET)
-
 def is_market_open():
     now_ist = datetime.now(IST).time()
-    return True
-    # return dtime(9, 15) <= now_ist <= dtime(15, 30)
-
+    return MARKET_OPEN_TIME <= now_ist <= MARKET_CLOSE_TIME
 
 def reset_on_new_trading_day():
-    today = datetime.now().date()
+    today = datetime.now(IST).date()
     if st.session_state.last_run_date != today and is_market_open():
         st.session_state.prev_oi = {}
         st.session_state.warmed_up = False
@@ -56,25 +55,21 @@ def reset_on_new_trading_day():
         st.session_state.last_run_date = today
         st.toast("New trading day → OI baseline reset", icon="🔄")
 
-
-def get_nifty_spot(fyers):
+@st.cache_data(ttl=60)  # Cache quotes for 1 minute
+def get_nifty_spot():
     try:
-        resp = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-        st.write("Raw quotes response:", resp)
-        if resp.get("s") != "ok":
+        q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
+        st.write("Raw quotes response:", q)  # Debug (remove later if needed)
+        if q.get("s") == "ok" and q.get("d"):
+            return round(q["d"][0]["v"]["lp"])
+        else:
+            st.error(f"Quotes API error: {q.get('message', 'Unknown')}")
             return None
-
-        data = resp.get("d", [])
-        if not data:
-            return None
-
-        return data[0]["v"].get("lp")
-
     except Exception as e:
-        print("Quote error:", e)
+        st.error(f"Quotes error: {e}")
         return None
 
-
+@st.cache_data(ttl=300)  # Cache option chain for 5 minutes
 def fetch_option_chain():
     try:
         resp = fyers.optionchain({
@@ -82,18 +77,20 @@ def fetch_option_chain():
             "strikecount": 20,
             "timestamp": ""
         })
+        st.write("Raw chain response:", resp)  # Debug
         if resp.get("s") != "ok":
+            st.error(f"Option chain error: {resp.get('message', 'Unknown')}")
             return None, None
         data = resp["data"]
         return data["optionsChain"], data.get("expiryData", [])
-    except:
+    except Exception as e:
+        st.error(f"Chain fetch error: {e}")
         return None, None
-
 
 def get_current_weekly_expiry(expiry_list):
     if not expiry_list:
         return "Unknown"
-    today = datetime.now().date()
+    today = datetime.now(IST).date()
     weekly = []
     for exp in expiry_list:
         try:
@@ -108,22 +105,11 @@ def get_current_weekly_expiry(expiry_list):
         return weekly[0][1]
     return expiry_list[0]["date"]
 
-
 # ================= CORE =================
 def scan_for_oi_spikes():
-    if not is_market_open():
-        return None, None, [], "Market Closed"
-
     reset_on_new_trading_day()
 
-    spot = get_nifty_spot(fyers)
-    if spot is None:
-        st.warning("Market closed or data unavailable right now")
-    else:
-        st.metric("NIFTY Spot", spot)
-
-    st.write(f"Debug: Spot = {spot}")
-
+    spot = get_nifty_spot()
     if not spot:
         return None, None, [], "Spot Error"
 
@@ -167,21 +153,20 @@ def scan_for_oi_spikes():
             pct = (oi - prev) / prev * 100
             if pct > OI_SPIKE_THRESHOLD:
                 new_alerts.append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "time": datetime.now(IST).strftime("%H:%M:%S"),
                     "msg": f"{opt_type} {strike} | +{pct:.1f}% | {prev:,} → {oi:,}"
                 })
 
     if not st.session_state.warmed_up:
         st.session_state.prev_oi = current_oi
         st.session_state.warmed_up = True
-        st.session_state.last_check = datetime.now().strftime("%H:%M:%S")
+        st.session_state.last_check = datetime.now(IST).strftime("%H:%M:%S")
         return spot, atm, [], expiry
 
     st.session_state.prev_oi = current_oi
-    st.session_state.last_check = datetime.now().strftime("%H:%M:%S")
+    st.session_state.last_check = datetime.now(IST).strftime("%H:%M:%S")
 
     return spot, atm, new_alerts, expiry
-
 
 # ================= UI =================
 spot, atm, new_alerts, expiry = scan_for_oi_spikes()
@@ -206,7 +191,7 @@ if spot:
     else:
         st.info("No significant OI spikes (>500%) detected yet")
 
-    st.success(f"Last checked: {st.session_state.last_check}  |  Refresh every 5 min")
+    st.success(f"Last checked: {st.session_state.last_check} | Refresh every 5 min")
 else:
     st.warning("Market closed or data unavailable right now")
 
