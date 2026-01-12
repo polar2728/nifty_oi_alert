@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
+import time
 from datetime import datetime, time as dtime, timezone, timedelta
 from fyers_apiv3 import fyersModel
+import threading
 
 # ================= CONFIG =================
 OI_SPIKE_THRESHOLD   = 500
@@ -12,7 +14,10 @@ STRIKE_RANGE_POINTS  = 150
 # IST timezone
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# ================= STREAMLIT SETUP =================
+# Prevent concurrent API calls during burst
+api_lock = threading.Lock()
+
+# ================= STREAMLIT =================
 st.set_page_config(page_title="Nifty OI Alert", layout="wide")
 st.title("🔥 NIFTY Weekly OI Spike Alert (ATM ±150)")
 st.caption("Alerts when OI increases >500% on current weekly expiry strikes")
@@ -21,7 +26,7 @@ st.caption("Alerts when OI increases >500% on current weekly expiry strikes")
 client_id    = st.secrets["client_id"]
 access_token = st.secrets["access_token"]
 
-# ================= FYERS CLIENT =================
+# ================= FYERS =================
 fyers = fyersModel.FyersModel(client_id=client_id, token=access_token, log_path="")
 
 # ================= SESSION STATE =================
@@ -29,10 +34,10 @@ if "prev_oi" not in st.session_state:
     st.session_state.prev_oi = {}
 if "alerts" not in st.session_state:
     st.session_state.alerts = []
-if "last_check" not in st.session_state:
-    st.session_state.last_check = None
 if "warmed_up" not in st.session_state:
     st.session_state.warmed_up = False
+if "last_check" not in st.session_state:
+    st.session_state.last_check = None
 if "last_run_date" not in st.session_state:
     st.session_state.last_run_date = None
 
@@ -50,35 +55,39 @@ def reset_on_new_trading_day():
         st.session_state.last_run_date = today
         st.toast("New trading day → OI baseline reset", icon="🔄")
 
-@st.cache_data(ttl=600, show_spinner="Fetching Nifty spot…")  # 10 minutes
+@st.cache_data(ttl=900, show_spinner="Fetching Nifty spot…")  # 15 min
 def get_nifty_spot():
-    try:
-        q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-        if q.get("s") == "ok" and q.get("d"):
-            return round(q["d"][0]["v"]["lp"])
-        else:
-            st.error(f"Quotes API error: {q}")
+    with api_lock:
+        time.sleep(0.6)  # tiny delay to avoid burst
+        try:
+            q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
+            if q.get("s") == "ok" and q.get("d"):
+                return round(q["d"][0]["v"]["lp"])
+            else:
+                st.error(f"Quotes API returned: {q}")
+                return None
+        except Exception as e:
+            st.error(f"Quotes call failed: {str(e)}")
             return None
-    except Exception as e:
-        st.error(f"Quotes exception: {str(e)}")
-        return None
 
-@st.cache_data(ttl=1800, show_spinner="Loading option chain…")  # 30 minutes
+@st.cache_data(ttl=3600, show_spinner="Loading option chain…")  # 1 hour
 def fetch_option_chain():
-    try:
-        resp = fyers.optionchain({
-            "symbol": "NSE:NIFTY50-INDEX",
-            "strikecount": 20,
-            "timestamp": ""
-        })
-        if resp.get("s") != "ok":
-            st.error(f"Option chain error: {resp}")
+    with api_lock:
+        time.sleep(0.6)
+        try:
+            resp = fyers.optionchain({
+                "symbol": "NSE:NIFTY50-INDEX",
+                "strikecount": 20,
+                "timestamp": ""
+            })
+            if resp.get("s") != "ok":
+                st.error(f"Option chain returned: {resp}")
+                return None, None
+            data = resp["data"]
+            return data.get("optionsChain", []), data.get("expiryData", [])
+        except Exception as e:
+            st.error(f"Option chain call failed: {str(e)}")
             return None, None
-        data = resp["data"]
-        return data["optionsChain"], data.get("expiryData", [])
-    except Exception as e:
-        st.error(f"Chain exception: {str(e)}")
-        return None, None
 
 def get_current_weekly_expiry(expiry_list):
     if not expiry_list:
@@ -98,11 +107,8 @@ def get_current_weekly_expiry(expiry_list):
         return weekly[0][1]
     return expiry_list[0]["date"] if expiry_list else "Unknown"
 
-# ================= CORE LOGIC =================
+# ================= CORE =================
 def scan_for_oi_spikes():
-    if not is_market_open():
-        return None, None, [], "Market Closed"
-
     reset_on_new_trading_day()
 
     spot = get_nifty_spot()
@@ -113,14 +119,14 @@ def scan_for_oi_spikes():
 
     raw, expiry_info = fetch_option_chain()
     if raw is None:
-        return spot, atm, [], "Option chain fetch failed"
+        return spot, atm, [], "Chain fetch failed"
 
     if not raw:
-        return spot, atm, [], "Empty option chain data"
+        return spot, atm, [], "Empty chain data"
 
     df = pd.DataFrame(raw)
     if df.empty:
-        return spot, atm, [], "No strikes returned"
+        return spot, atm, [], "No strikes in chain"
 
     expiry = get_current_weekly_expiry(expiry_info)
 
@@ -189,11 +195,11 @@ if spot:
     else:
         st.info("No significant OI spikes (>500%) detected yet")
 
-    st.success(f"Last checked: {st.session_state.last_check or 'N/A'}")
+    st.success(f"Last checked: {st.session_state.last_check or '—'}")
 
 else:
     st.warning("Market closed or data unavailable right now")
 
-# Manual refresh only — prevents burst calls
-if st.button("Refresh Now"):
+# Only manual refresh
+if st.button("Refresh Data Now"):
     st.rerun()
