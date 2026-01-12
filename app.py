@@ -201,7 +201,7 @@ def scan():
     st.subheader(f"📅 Weekly Expiry: {expiry}")
     st.dataframe(
         style_table(df_view),
-        use_container_width=True,
+        width="stretch",
         hide_index=True
     )
 
