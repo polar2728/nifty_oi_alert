@@ -57,14 +57,23 @@ def reset_on_new_trading_day():
         st.toast("New trading day → OI baseline reset", icon="🔄")
 
 
-def get_nifty_spot():
+def get_nifty_spot(fyers):
     try:
-        q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-        st.write("Raw quotes response:", q)  # This will show in app/logs
-        return round(q["d"][0]["v"]["lp"])
+        resp = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
+
+        if resp.get("s") != "ok":
+            return None
+
+        data = resp.get("d", [])
+        if not data:
+            return None
+
+        return data[0]["v"].get("lp")
+
     except Exception as e:
-        st.error(f"Quotes error: {e}")
+        print("Quote error:", e)
         return None
+
 
 def fetch_option_chain():
     try:
@@ -108,7 +117,13 @@ def scan_for_oi_spikes():
     reset_on_new_trading_day()
 
     spot = get_nifty_spot()
+    if spot is None:
+        st.warning("Market closed or data unavailable right now")
+    else:
+        st.metric("NIFTY Spot", spot)
+
     st.write(f"Debug: Spot = {spot}")
+    
     if not spot:
         return None, None, [], "Spot Error"
 
