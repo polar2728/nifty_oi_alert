@@ -116,14 +116,14 @@ def scan_for_oi_spikes():
 
     reset_on_new_trading_day()
 
-    spot = get_nifty_spot()
+    spot = get_nifty_spot(fyers)
     if spot is None:
         st.warning("Market closed or data unavailable right now")
     else:
         st.metric("NIFTY Spot", spot)
 
     st.write(f"Debug: Spot = {spot}")
-    
+
     if not spot:
         return None, None, [], "Spot Error"
 
