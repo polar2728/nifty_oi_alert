@@ -15,7 +15,7 @@ st.caption("Manual scan • Streamlit Cloud compatible")
 # ================= CONFIG =================
 OI_SPIKE_THRESHOLD  = 500
 MIN_BASE_OI         = 1000
-STRIKE_RANGE_POINTS = 150
+STRIKE_RANGE_POINTS = 100
 
 # ================= TIMEZONE =================
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -176,7 +176,7 @@ def scan():
     )
 
     st.subheader(f"Monitoring {len(df_view)} strikes (Expiry: {expiry})")
-    st.dataframe(df_view, use_container_width=True)
+    st.dataframe(df_view, use_container_width=True, width="stretch")
 
     if alerts:
         st.subheader("🚨 OI Spike Alerts")
@@ -185,7 +185,8 @@ def scan():
                 alerts,
                 columns=["Type", "Strike", "OI Prev", "OI Now", "OI %"]
             ),
-            use_container_width=True
+            use_container_width=True,
+            width="stretch"
         )
     else:
         st.success("No OI spikes detected")
