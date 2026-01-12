@@ -43,7 +43,8 @@ IST = timezone(IST_OFFSET)
 
 def is_market_open():
     now_ist = datetime.now(IST).time()
-    return dtime(9, 15) <= now_ist <= dtime(15, 30)
+    return True
+    # return dtime(9, 15) <= now_ist <= dtime(15, 30)
 
 
 def reset_on_new_trading_day():
@@ -106,6 +107,7 @@ def scan_for_oi_spikes():
     reset_on_new_trading_day()
 
     spot = get_nifty_spot()
+    st.write(f"Debug: Spot = {spot}")
     if not spot:
         return None, None, [], "Spot Error"
 
