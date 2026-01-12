@@ -60,7 +60,7 @@ def reset_on_new_trading_day():
 def get_nifty_spot(fyers):
     try:
         resp = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-
+        st.write("Raw quotes response:", resp)
         if resp.get("s") != "ok":
             return None
 
