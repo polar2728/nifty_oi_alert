@@ -5,7 +5,7 @@ from datetime import datetime, time as dtime, timezone, timedelta
 from fyers_apiv3 import fyersModel
 
 # ================= CONFIG =================
-REFRESH_INTERVAL     = 300           # 5 minutes
+REFRESH_INTERVAL     = 300           # 5 min
 OI_SPIKE_THRESHOLD   = 500
 MIN_BASE_OI          = 1000
 MAX_ALERTS_TO_KEEP   = 50
@@ -13,14 +13,14 @@ MARKET_OPEN_TIME     = dtime(9, 15)
 MARKET_CLOSE_TIME    = dtime(15, 30)
 STRIKE_RANGE_POINTS  = 150
 
-# IST timezone setup
+# IST timezone
 IST_OFFSET = timedelta(hours=5, minutes=30)
 IST = timezone(IST_OFFSET)
 
 # ================= STREAMLIT =================
 st.set_page_config(page_title="Nifty OI Alert", layout="wide")
 st.title("🔥 NIFTY Weekly OI Spike Alert (ATM ±150)")
-st.caption("Alerts when OI increases >500% on current weekly expiry strikes")
+st.caption("Alerts when OI increases >500% on current weekly expiry strikes | Refresh every 5 min")
 
 # ================= SECRETS =================
 client_id = st.secrets["client_id"]
@@ -55,21 +55,21 @@ def reset_on_new_trading_day():
         st.session_state.last_run_date = today
         st.toast("New trading day → OI baseline reset", icon="🔄")
 
-@st.cache_data(ttl=60)  # Cache quotes for 1 minute
+@st.cache_data(ttl=300, show_spinner="Fetching Nifty spot...")  # Longer TTL to reduce calls
 def get_nifty_spot():
     try:
+        time.sleep(2)
         q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-        st.write("Raw quotes response:", q)  # Debug (remove later if needed)
         if q.get("s") == "ok" and q.get("d"):
             return round(q["d"][0]["v"]["lp"])
         else:
-            st.error(f"Quotes API error: {q.get('message', 'Unknown')}")
+            st.error(f"Quotes API failed: {q}")
             return None
     except Exception as e:
-        st.error(f"Quotes error: {e}")
+        st.error(f"Quotes exception: {str(e)}")
         return None
 
-@st.cache_data(ttl=300)  # Cache option chain for 5 minutes
+@st.cache_data(ttl=600, show_spinner="Loading option chain...")  # 10 min for chain
 def fetch_option_chain():
     try:
         resp = fyers.optionchain({
@@ -77,14 +77,13 @@ def fetch_option_chain():
             "strikecount": 20,
             "timestamp": ""
         })
-        st.write("Raw chain response:", resp)  # Debug
         if resp.get("s") != "ok":
-            st.error(f"Option chain error: {resp.get('message', 'Unknown')}")
+            st.error(f"Option chain failed: {resp}")
             return None, None
         data = resp["data"]
         return data["optionsChain"], data.get("expiryData", [])
     except Exception as e:
-        st.error(f"Chain fetch error: {e}")
+        st.error(f"Chain exception: {str(e)}")
         return None, None
 
 def get_current_weekly_expiry(expiry_list):
@@ -103,10 +102,13 @@ def get_current_weekly_expiry(expiry_list):
     if weekly:
         weekly.sort()
         return weekly[0][1]
-    return expiry_list[0]["date"]
+    return expiry_list[0]["date"] if expiry_list else "Unknown"
 
 # ================= CORE =================
 def scan_for_oi_spikes():
+    # if not is_market_open():
+    #     return None, None, [], "Market Closed"   # Comment out to force-run if needed
+
     reset_on_new_trading_day()
 
     spot = get_nifty_spot()
@@ -122,17 +124,15 @@ def scan_for_oi_spikes():
     df = pd.DataFrame(raw)
     expiry = get_current_weekly_expiry(expiry_info)
 
-    # Filter current weekly expiry
     df = df[df["symbol"].str.contains(expiry, regex=False, na=False)]
 
-    # ATM range
     df = df[
         (df["strike_price"] >= atm - STRIKE_RANGE_POINTS) &
         (df["strike_price"] <= atm + STRIKE_RANGE_POINTS)
     ]
 
     if df.empty:
-        return spot, atm, [], f"{expiry} (no strikes found)"
+        return spot, atm, [], f"{expiry} (no strikes)"
 
     current_oi = {}
     new_alerts = []
@@ -147,9 +147,7 @@ def scan_for_oi_spikes():
 
         prev = st.session_state.prev_oi.get(key, 0)
 
-        if (st.session_state.warmed_up and 
-            prev >= MIN_BASE_OI and 
-            oi > prev):
+        if st.session_state.warmed_up and prev >= MIN_BASE_OI and oi > prev:
             pct = (oi - prev) / prev * 100
             if pct > OI_SPIKE_THRESHOLD:
                 new_alerts.append({
