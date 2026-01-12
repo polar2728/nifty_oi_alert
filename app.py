@@ -60,10 +60,11 @@ def reset_on_new_trading_day():
 def get_nifty_spot():
     try:
         q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
+        st.write("Raw quotes response:", q)  # This will show in app/logs
         return round(q["d"][0]["v"]["lp"])
-    except:
+    except Exception as e:
+        st.error(f"Quotes error: {e}")
         return None
-
 
 def fetch_option_chain():
     try:
