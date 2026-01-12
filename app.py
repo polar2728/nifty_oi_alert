@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone, timedelta
 from fyers_apiv3 import fyersModel
 
 # ================= CONFIG =================
@@ -38,9 +38,12 @@ for key in ["prev_oi", "alerts", "last_check", "warmed_up", "last_run_date"]:
             st.session_state[key] = None
 
 # ================= HELPERS =================
+IST_OFFSET = timedelta(hours=5, minutes=30)
+IST = timezone(IST_OFFSET)
+
 def is_market_open():
-    now = datetime.now().time()
-    return MARKET_OPEN_TIME <= now <= MARKET_CLOSE_TIME
+    now_ist = datetime.now(IST).time()
+    return dtime(9, 15) <= now_ist <= dtime(15, 30)
 
 
 def reset_on_new_trading_day():
